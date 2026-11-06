@@ -1,21 +1,34 @@
-name: probe-crc
+name: verify-source
 
-# 快速探针：只编 3 个目标文件，取出 genksyms 算出的符号 CRC，
-# 和设备 vendor 模块的基准值对比，用来确认哪棵树和设备内核一致。
+# ABI 校验器：给定一个内核源码仓库/分支/commit，只编 3 个目标文件，
+# 取 genksyms 算出的符号 CRC，和设备 vendor 模块的基准逐条对比。
+# 用途：在【不编译全量内核、不刷机】的前提下，判定这棵树能不能直接加载设备的 vendor 模块。
+# 单轮约 5-8 分钟。
 
 on:
   workflow_dispatch:
+    inputs:
+      repo:
+        description: '源码仓库（owner/name）'
+        type: string
+        default: 'ztc1997/android_gki_kernel_5.10_common'
+      ref:
+        description: '分支或 tag（用 commit 时留空）'
+        type: string
+        default: 'android12-5.10-2025-09'
+      commit:
+        description: '精确 commit sha（填了就忽略 ref）'
+        type: string
+        default: ''
+      submodules:
+        description: '是否拉取子模块（susfs 等分支需要）'
+        type: boolean
+        default: true
 
 jobs:
-  probe:
+  verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        branch:
-          - android12-5.10-2025-09_susfs
-    name: ${{ matrix.branch }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,13 +41,29 @@ jobs:
           sudo bash /tmp/llvm.sh 22
           /usr/lib/llvm-22/bin/clang --version | head -1
 
-      - name: 拉取内核源码（含子模块）
+      - name: 拉取源码
         run: |
-          git clone --depth 1 --recurse-submodules --shallow-submodules \
-            -b "${{ matrix.branch }}" \
-            https://github.com/ztc1997/android_gki_kernel_5.10_common.git kernel
+          set -e
+          SUB=""
+          if [ "${{ inputs.submodules }}" = "true" ]; then
+            SUB="--recurse-submodules --shallow-submodules"
+          fi
+          if [ -n "${{ inputs.commit }}" ]; then
+            echo "按 commit 拉取: ${{ inputs.commit }}"
+            git init kernel
+            git -C kernel remote add origin "https://github.com/${{ inputs.repo }}.git"
+            git -C kernel fetch --depth 1 $SUB origin "${{ inputs.commit }}"
+            git -C kernel checkout FETCH_HEAD
+            if [ "${{ inputs.submodules }}" = "true" ]; then
+              git -C kernel submodule update --init --recursive --depth 1 || true
+            fi
+          else
+            git clone --depth 1 $SUB -b "${{ inputs.ref }}" \
+              "https://github.com/${{ inputs.repo }}.git" kernel
+          fi
+          echo "== 实际 checkout =="
           git -C kernel rev-parse HEAD
-          git -C kernel submodule status || true
+          git -C kernel log -1 --format='%ad %s' --date=iso
           sed -n '1,5p' kernel/Makefile
 
       - name: 去掉 AOSP 专属 MLGO 标志
@@ -45,7 +74,7 @@ jobs:
           done
           echo "清理: ${hits:-无}"
 
-      - name: 生成配置
+      - name: 生成配置（设备原配置，不叠加任何性能补丁）
         run: |
           export PATH="/usr/lib/llvm-22/bin:$PATH"
           mkdir -p out
@@ -57,18 +86,19 @@ jobs:
           make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- olddefconfig > /dev/null
-          grep -E '^(CONFIG_MODULE_SCMVERSION|CONFIG_LOCALVERSION|CONFIG_BBG|CONFIG_KSU)' out/.config || true
-          grep -E '^# CONFIG_(BBG|KSU) is not set' out/.config || true
+          echo "== 关键项 =="
+          grep -E '^(CONFIG_MODULE_SCMVERSION|CONFIG_LOCALVERSION|CONFIG_MODVERSIONS|CONFIG_PREEMPT)=' out/.config || true
 
-      - name: 编 3 个文件取 CRC
+      - name: 编目标文件并对比 CRC
         run: |
           export PATH="/usr/lib/llvm-22/bin:$PATH"
           MK=(make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1
               CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
               CROSS_COMPILE_COMPAT=arm-linux-gnueabi-)
-          "${MK[@]}" -j"$(nproc)" drivers/base/core.o mm/page_alloc.o fs/anon_inodes.o > build.log 2>&1 \
-            || { echo "编译失败"; tail -25 build.log; exit 1; }
-          echo "== 本次 CRC =="
-          grep -rhE "^__crc_(__alloc_pages_nodemask|_dev_err|anon_inode_getfd) = " out --include=*.symversions || true
-          echo "== 设备期望 =="
-          grep -E " (_dev_err|__alloc_pages_nodemask|anon_inode_getfd)$" refs/vendor_crc.txt
+          "${MK[@]}" -j"$(nproc)" drivers/base/core.o mm/page_alloc.o fs/anon_inodes.o \
+            kernel/module.o > build.log 2>&1 || { echo "编译失败"; tail -25 build.log; exit 1; }
+          echo "== 本次 CRC（探针符号） =="
+          grep -rhE "^__crc_(__alloc_pages_nodemask|_dev_err|anon_inode_getfd|module_layout) = " \
+            out --include=*.symversions | sort
+          echo "== 设备基准（期望） =="
+          grep -E " (__alloc_pages_nodemask|_dev_err|anon_inode_getfd|module_layout)$" refs/vendor_crc.txt
