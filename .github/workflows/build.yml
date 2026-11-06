@@ -1,0 +1,131 @@
+name: build-pearl-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: '内核源码分支'
+        type: string
+        default: 'android12-5.10-2025-09'
+      zstd_upgrade:
+        description: '升级内核 zstd 1.4.10 -> 1.5.7（实验性，会关闭 f2fs/squashfs 的 zstd 压缩）'
+        type: boolean
+        default: false
+      jobs:
+        description: '并行任务数（留空自动）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: 检出构建脚本
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev zip unzip rsync cpio \
+            xz-utils device-tree-compiler python3 curl git
+          bc --version | head -1
+          python3 --version
+
+      - name: 增加 swap（LTO 链接吃内存）
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile >/dev/null
+          sudo swapon /swapfile
+          free -g
+
+      - name: 缓存 AOSP clang
+        id: clangcache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: aosp-clang-r584948-v1
+
+      - name: 下载 AOSP clang r584948（与设备内核同版本）
+        if: steps.clangcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/clang"
+          curl -L --retry 3 -o /tmp/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r584948.tar.gz"
+          tar -C "$HOME/clang" -zxf /tmp/clang.tar.gz
+          "$HOME/clang/bin/clang" --version
+
+      - name: 拉取内核源码（ztc1997 GKI 5.10）
+        run: |
+          BRANCH="${{ inputs.base_branch }}"
+          [ -z "$BRANCH" ] && BRANCH="android12-5.10-2025-09"
+          git clone --depth 1 -b "$BRANCH" \
+            https://github.com/ztc1997/android_gki_kernel_5.10_common.git kernel
+          cd kernel && git log --oneline -1 && cd ..
+
+      - name: 升级内核 zstd（实验性）
+        if: ${{ inputs.zstd_upgrade }}
+        run: bash scripts/upgrade_zstd.sh "$PWD/kernel"
+
+      - name: 生成 .config（设备原配置 + 性能补丁）
+        run: |
+          mkdir -p out
+          cp configs/device.config out/.config
+          python3 scripts/set_config.py out/.config configs/perf.config
+          if [ "${{ inputs.zstd_upgrade }}" = "true" ]; then
+            python3 scripts/set_config.py out/.config configs/zstd-upgrade.config
+          fi
+          export PATH="$HOME/clang/bin:$PATH"
+          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|ZSTD_COMPRESS|LOCALVERSION)=' out/.config
+
+      - name: 编译内核 Image
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          export JOBS="${{ inputs.jobs }}"
+          [ -z "$JOBS" ] && JOBS="$(nproc)"
+          echo "jobs=$JOBS"
+          export KBUILD_BUILD_USER=build
+          export KBUILD_BUILD_HOST=pearl-ci
+          export KBUILD_BUILD_TIMESTAMP="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          time make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$JOBS" Image
+
+      - name: 校验 vermagic（必须是设备原串，否则 vendor 模块加载失败）
+        run: |
+          REL="$(cat out/include/config/kernel.release)"
+          echo "kernel.release = $REL"
+          EXPECT="5.10.240-ztc1997-android12-9-02429-gb280068f4235"
+          if [ "$REL" != "$EXPECT" ]; then
+            echo "::error::vermagic 不匹配，期望 $EXPECT"
+            exit 1
+          fi
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: 打包产物
+        run: |
+          mkdir -p dist
+          REL="$(cat out/include/config/kernel.release)"
+          cp out/arch/arm64/boot/Image "dist/Image-$REL"
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          zip -9 "kernel-Image.zip" * -x "*.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-Image
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
