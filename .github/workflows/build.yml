@@ -46,9 +46,11 @@ jobs:
           # AOSP 的 clang 归档在 CI 上拿不到（返回的是错误页而不是 tar.gz），
           # 改用 apt.llvm.org 的正式版 clang：设备内核是 clang 22.0.1，优先 22，失败回退 21/20。
           curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          LLVM_VERSION=""
           for v in 22 21 20; do
             echo "== 尝试 clang-$v =="
             if sudo bash /tmp/llvm.sh "$v" && [ -x "/usr/lib/llvm-$v/bin/clang" ]; then
+              LLVM_VERSION="$v"
               echo "LLVM_VERSION=$v" >> "$GITHUB_ENV"
               break
             fi
