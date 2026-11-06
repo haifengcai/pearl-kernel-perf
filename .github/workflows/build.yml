@@ -21,8 +21,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
+    env:
+      EXPECT_RELEASE: '5.10.240-ztc1997-android12-9-02429-gb280068f4235'
     steps:
       - name: 检出构建脚本
         uses: actions/checkout@v4
@@ -30,18 +32,30 @@ jobs:
       - name: 释放磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+                      /usr/local/lib/node_modules
           sudo apt-get clean
           df -h /
 
-      - name: 安装构建依赖
+      - name: 安装构建依赖与 LLVM 工具链
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev zip unzip rsync cpio \
             xz-utils device-tree-compiler python3 curl git
-          bc --version | head -1
-          python3 --version
+          # AOSP 的 clang 归档在 CI 上拿不到（返回的是错误页而不是 tar.gz），
+          # 改用 apt.llvm.org 的正式版 clang：设备内核是 clang 22.0.1，优先 22，失败回退 21/20。
+          curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          for v in 22 21 20; do
+            echo "== 尝试 clang-$v =="
+            if sudo bash /tmp/llvm.sh "$v" && [ -x "/usr/lib/llvm-$v/bin/clang" ]; then
+              echo "LLVM_VERSION=$v" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          test -n "$LLVM_VERSION" || { echo "::error::LLVM 安装失败"; exit 1; }
+          "/usr/lib/llvm-$LLVM_VERSION/bin/clang" --version
+          "/usr/lib/llvm-$LLVM_VERSION/bin/ld.lld" --version
 
       - name: 增加 swap（LTO 链接吃内存）
         run: |
@@ -51,22 +65,6 @@ jobs:
           sudo mkswap /swapfile >/dev/null
           sudo swapon /swapfile
           free -g
-
-      - name: 缓存 AOSP clang
-        id: clangcache
-        uses: actions/cache@v4
-        with:
-          path: ~/clang
-          key: aosp-clang-r584948-v1
-
-      - name: 下载 AOSP clang r584948（与设备内核同版本）
-        if: steps.clangcache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$HOME/clang"
-          curl -L --retry 3 -o /tmp/clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r584948.tar.gz"
-          tar -C "$HOME/clang" -zxf /tmp/clang.tar.gz
-          "$HOME/clang/bin/clang" --version
 
       - name: 拉取内核源码（ztc1997 GKI 5.10）
         run: |
@@ -82,22 +80,22 @@ jobs:
 
       - name: 生成 .config（设备原配置 + 性能补丁）
         run: |
+          export PATH="/usr/lib/llvm-$LLVM_VERSION/bin:$PATH"
           mkdir -p out
           cp configs/device.config out/.config
           python3 scripts/set_config.py out/.config configs/perf.config
           if [ "${{ inputs.zstd_upgrade }}" = "true" ]; then
             python3 scripts/set_config.py out/.config configs/zstd-upgrade.config
           fi
-          export PATH="$HOME/clang/bin:$PATH"
           make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-          grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|ZSTD_COMPRESS|LOCALVERSION)=' out/.config
+          grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|WERROR|LOCALVERSION)=' out/.config
 
       - name: 编译内核 Image
         run: |
-          export PATH="$HOME/clang/bin:$PATH"
+          export PATH="/usr/lib/llvm-$LLVM_VERSION/bin:$PATH"
           export JOBS="${{ inputs.jobs }}"
           [ -z "$JOBS" ] && JOBS="$(nproc)"
-          echo "jobs=$JOBS"
+          echo "jobs=$JOBS clang=$(clang --version | head -1)"
           export KBUILD_BUILD_USER=build
           export KBUILD_BUILD_HOST=pearl-ci
           export KBUILD_BUILD_TIMESTAMP="$(date -u '+%Y-%m-%d %H:%M:%S')"
@@ -107,9 +105,8 @@ jobs:
         run: |
           REL="$(cat out/include/config/kernel.release)"
           echo "kernel.release = $REL"
-          EXPECT="5.10.240-ztc1997-android12-9-02429-gb280068f4235"
-          if [ "$REL" != "$EXPECT" ]; then
-            echo "::error::vermagic 不匹配，期望 $EXPECT"
+          if [ "$REL" != "$EXPECT_RELEASE" ]; then
+            echo "::error::vermagic 不匹配，期望 $EXPECT_RELEASE"
             exit 1
           fi
           ls -lh out/arch/arm64/boot/Image
@@ -119,6 +116,7 @@ jobs:
           mkdir -p dist
           REL="$(cat out/include/config/kernel.release)"
           cp out/arch/arm64/boot/Image "dist/Image-$REL"
+          cp out/.config "dist/config-${REL}.txt"
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
           zip -9 "kernel-Image.zip" * -x "*.zip"
 
