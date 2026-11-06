@@ -25,6 +25,9 @@ jobs:
     timeout-minutes: 300
     env:
       EXPECT_RELEASE: '5.10.240-ztc1997-android12-9-02429-gb280068f4235'
+      # scripts/setlocalversion 在 LOCALVERSION 未定义且工作树有改动时会追加 "+"，
+      # 这里显式置空（"已定义且为空"）把它压掉，保证 kernel.release 和设备完全一致。
+      LOCALVERSION: ''
     steps:
       - name: 检出构建脚本
         uses: actions/checkout@v4
@@ -123,14 +126,34 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- -j"$JOBS" Image
 
-      - name: 校验 vermagic（必须是设备原串，否则 vendor 模块加载失败）
+      - name: 校验 ABI（vermagic 标志位 + 导出符号 CRC 门禁）
         run: |
           REL="$(cat out/include/config/kernel.release)"
           echo "kernel.release = $REL"
           if [ "$REL" != "$EXPECT_RELEASE" ]; then
-            echo "::error::vermagic 不匹配，期望 $EXPECT_RELEASE"
+            echo "::error::kernel.release 不是设备原串，期望 $EXPECT_RELEASE"
             exit 1
           fi
+
+          # MODVERSIONS 下模块加载时版本号 token 会被跳过，只比较后面的标志位，
+          # 所以这里把这几个标志位单独断言一遍——它比版本号更容易被配置改动带偏。
+          FLAGS="SMP"
+          grep -q '^CONFIG_PREEMPT=y'        out/.config && FLAGS="$FLAGS preempt"
+          grep -q '^CONFIG_PREEMPT_VOLUNTARY=y' out/.config && FLAGS="$FLAGS preempt_voluntary"
+          grep -q '^CONFIG_MODULE_UNLOAD=y'  out/.config && FLAGS="$FLAGS mod_unload"
+          grep -q '^CONFIG_MODVERSIONS=y'    out/.config && FLAGS="$FLAGS modversions"
+          FLAGS="$FLAGS aarch64"
+          echo "本次 vermagic 标志位: $FLAGS"
+          if [ "$FLAGS" != "SMP preempt mod_unload modversions aarch64" ]; then
+            echo "::error::vermagic 标志位与 vendor 模块不一致，所有 .ko 都会拒绝加载"
+            exit 1
+          fi
+
+          # 真正的硬门禁：1340 个导出符号的 CRC 必须和出厂 vendor 模块逐一对上，
+          # 否则就是 "disagrees about version of symbol" → 黑屏 / 无限重启。
+          SYMVERS=out/Module.symvers
+          [ -f "$SYMVERS" ] || SYMVERS=out/vmlinux.symvers
+          python3 scripts/check_crc.py "$SYMVERS" refs/vendor_crc.txt
           ls -lh out/arch/arm64/boot/Image
 
       - name: 打包产物
@@ -139,6 +162,9 @@ jobs:
           REL="$(cat out/include/config/kernel.release)"
           cp out/arch/arm64/boot/Image "dist/Image-$REL"
           cp out/.config "dist/config-${REL}.txt"
+          cp out/System.map "dist/System.map-$REL"
+          cp out/Module.symvers "dist/Module.symvers-$REL" 2>/dev/null || cp out/vmlinux.symvers "dist/Module.symvers-$REL"
+          grep -E '^(Linux version|clang version)' <(strings out/arch/arm64/boot/Image | head -2000) > "dist/build-info.txt" || true
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
           zip -9 "kernel-Image.zip" * -x "*.zip"
 
