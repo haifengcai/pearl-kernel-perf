@@ -62,7 +62,7 @@ jobs:
       - name: 增加 swap（LTO 链接吃内存）
         run: |
           sudo swapoff -a || true
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile >/dev/null
           sudo swapon /swapfile
