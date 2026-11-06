@@ -51,6 +51,14 @@ jobs:
           grep -rn "SCMVERSION" kernel/ --include=Kconfig* | head -5 || echo "Kconfig 里没有"
           grep -rn "scmversion" kernel/include/linux/module.h | head -5 || true
 
+      - name: 去掉 AOSP 专属 MLGO 标志
+        run: |
+          hits=$(grep -rl -e 'regalloc-enable-advisor' -e 'hot-cold-split=true' kernel/ 2>/dev/null || true)
+          echo "命中文件: ${hits:-无}"
+          for f in $hits; do
+            sed -i '/regalloc-enable-advisor=release/d; /hot-cold-split=true/d' "$f"
+          done
+
       - name: 生成配置
         run: |
           export PATH="/usr/lib/llvm-${{ matrix.llvm }}/bin:$PATH"
