@@ -1,0 +1,78 @@
+name: diagnose-config
+
+# 只跑 olddefconfig 并 diff 设备原配置，不编译。
+# 用途：确认 .config 在 Kconfig 求值后有没有被悄悄改动——任何改动都可能
+# 改变结构体布局，从而让 lib/genksyms 算出的导出符号 CRC 和 vendor 模块对不上。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖与 LLVM（Kconfig 的 cc-option 测试需要真编译器）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 curl
+          curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          for v in 22 21 20; do
+            if sudo bash /tmp/llvm.sh "$v" && [ -x "/usr/lib/llvm-$v/bin/clang" ]; then
+              echo "LLVM_VERSION=$v" >> "$GITHUB_ENV"; break
+            fi
+          done
+          "/usr/lib/llvm-$LLVM_VERSION/bin/clang" --version | head -1
+
+      - name: 拉取内核源码
+        run: |
+          git clone --depth 1 -b android12-5.10-2025-09 \
+            https://github.com/ztc1997/android_gki_kernel_5.10_common.git kernel
+
+      - name: 生成配置
+        run: |
+          export PATH="/usr/lib/llvm-$LLVM_VERSION/bin:$PATH"
+          export LOCALVERSION=""
+          mkdir -p out
+          cp configs/device.config out/.config
+          cp configs/device.config device.orig
+          python3 scripts/set_config.py out/.config configs/perf.config
+          cp out/.config with_perf
+          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- olddefconfig > /dev/null
+          echo "== 行数：设备原配置 / 应用 perf 后 / olddefconfig 后 =="
+          wc -l device.orig with_perf out/.config
+
+      - name: 差异（设备原配置 -> 实际生效配置）
+        run: |
+          echo "############ 1) perf.config 自身引入的改动 ############"
+          diff -u device.orig with_perf | grep -E '^[-+][^-+]' | head -60 || true
+
+          echo
+          echo "############ 2) olddefconfig 吃掉的/改写的（关键） ############"
+          diff -u with_perf out/.config > defconfig.diff || true
+          echo "差异行数: $(wc -l < defconfig.diff)"
+          grep -E '^[-+][^-+]' defconfig.diff | head -200 || true
+
+          echo
+          echo "############ 3) 结构体布局敏感项对照 ############"
+          PAT='^CONFIG_(NR_CPUS|NR_IRQS|MAXSMP|CPUMASK_OFFSTACK|NODES_SHIFT|NUMA|SMP|MEMCG|PSI|SECURITY|SECURITY_SELINUX|FS_POSIX_ACL|QUOTA|EPOLL|FSNOTIFY|IMA|FS_ENCRYPTION|FS_VERITY|CGROUPS|CGROUP_SCHED|CGROUP_BPF|CGROUP_WRITEBACK|NET_CLS_ACT|NETFILTER|NET_SCHED|XFRM|WIRELESS|TLS|BPF_SYSCALL|BPF_JIT|BPF_EVENTS|MODULE_UNLOAD|KALLSYMS|KPROBES|FTRACE|PERF_EVENTS|PM|PM_SLEEP|PM_CLK|PM_GENERIC_DOMAINS|ENERGY_MODEL|CPU_FREQ|CPU_IDLE|THERMAL|DEBUG_LOCK_ALLOC|LOCKDEP|PROVE_LOCKING|DEBUG_SPINLOCK|DEBUG_MUTEXES|RANDSTRUCT|GCC_PLUGIN_RANDSTRUCT|CFI_CLANG|SHADOW_CALL_STACK|LTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|ARM64_PTR_AUTH|ARM64_BTI|STACKPROTECTOR|HARDENED_USERCOPY|FORTIFY_SOURCE|INIT_ON_ALLOC_DEFAULT_ON|INIT_ON_FREE_DEFAULT_ON|SLAB_FREELIST_RANDOM|SLUB_DEBUG|ZONE_DEVICE|MEMORY_HOTPLUG|TRANSPARENT_HUGEPAGE|KASAN|KFENCE|DEBUG_PAGEALLOC|PAGE_POISONING)='
+          for f in device.orig out/.config; do
+            echo "--- $f"
+            grep -E "$PAT" "$f" | sort
+          done
+          echo "--- 仅存在于一侧的项"
+          comm -3 <(grep -E "$PAT" device.orig | sort) <(grep -E "$PAT" out/.config | sort) || true
+
+      - name: 上传差异报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-diff
+          path: |
+            defconfig.diff
+            out/.config
+            device.orig
