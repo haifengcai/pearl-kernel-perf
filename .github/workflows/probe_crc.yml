@@ -71,12 +71,19 @@ jobs:
 
       - name: 只编 3 个目标文件并取出 CRC
         run: |
+          set -o pipefail
           export PATH="/usr/lib/llvm-${{ matrix.llvm }}/bin:$PATH"
           export LOCALVERSION=""
-          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- -j"$(nproc)" \
-            drivers/base/core.o mm/page_alloc.o fs/anon_inodes.o 2>&1 | tail -20
+          MK=(make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1
+              CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
+              CROSS_COMPILE_COMPAT=arm-linux-gnueabi-)
+          set +e
+          "${MK[@]}" -j"$(nproc)" drivers/base/core.o mm/page_alloc.o fs/anon_inodes.o > build.log 2>&1
+          rc=$?
+          set -e
+          echo "make exit=$rc"
+          grep -nE "error:|Error [0-9]|No rule|No such file" build.log | head -20 || true
+          tail -30 build.log
           echo "== 生成出来的 symversions 文件 =="
           find out -name "*.symversions" | head
           echo "== 目标符号 CRC（本次） =="
