@@ -1,0 +1,85 @@
+name: probe-crc
+
+# 快速探针：只编 3 个目标文件，取出 genksyms 算出的符号 CRC，
+# 和设备 vendor 模块里的基准值对比。用来定位「为什么 556 个符号 CRC 对不上」。
+# 不做全量编译，单轮约 5-8 分钟。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clang22-perf
+            llvm: '22'
+            cfg: perf
+          - name: clang22-pristine
+            llvm: '22'
+            cfg: pristine
+          - name: clang18-pristine
+            llvm: '18'
+            cfg: pristine
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖与 LLVM ${{ matrix.llvm }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 curl xz-utils
+          if [ "${{ matrix.llvm }}" = "18" ]; then
+            sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18
+          else
+            curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+            sudo bash /tmp/llvm.sh "${{ matrix.llvm }}"
+          fi
+          "/usr/lib/llvm-${{ matrix.llvm }}/bin/clang" --version | head -1
+
+      - name: 拉取内核源码
+        run: |
+          git clone --depth 1 -b android12-5.10-2025-09 \
+            https://github.com/ztc1997/android_gki_kernel_5.10_common.git kernel
+          git -C kernel rev-parse HEAD
+          git -C kernel log --oneline -3
+          echo "== 树里有没有 SCMVERSION 选项 =="
+          grep -rn "SCMVERSION" kernel/ --include=Kconfig* | head -5 || echo "Kconfig 里没有"
+          grep -rn "scmversion" kernel/include/linux/module.h | head -5 || true
+
+      - name: 生成配置
+        run: |
+          export PATH="/usr/lib/llvm-${{ matrix.llvm }}/bin:$PATH"
+          export LOCALVERSION=""
+          mkdir -p out
+          cp configs/device.config out/.config
+          # 关掉 -Werror 只是为了让新版 clang 的告警不打断编译，不影响 CRC
+          printf '# CONFIG_WERROR is not set\n' > /tmp/nowerror.config
+          python3 scripts/set_config.py out/.config /tmp/nowerror.config
+          if [ "${{ matrix.cfg }}" = "perf" ]; then
+            python3 scripts/set_config.py out/.config configs/perf.config
+          fi
+          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- olddefconfig > /dev/null
+          echo "== 关键项 =="
+          grep -E '^(CONFIG_MODULE_SCMVERSION|CONFIG_LTO_CLANG(_THIN|_FULL)?|CONFIG_CFI_CLANG|CONFIG_PREEMPT|CONFIG_MODVERSIONS)=' out/.config
+
+      - name: 只编 3 个目标文件并取出 CRC
+        run: |
+          export PATH="/usr/lib/llvm-${{ matrix.llvm }}/bin:$PATH"
+          export LOCALVERSION=""
+          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- -j"$(nproc)" \
+            drivers/base/core.o mm/page_alloc.o fs/anon_inodes.o 2>&1 | tail -20
+          echo "== 生成出来的 symversions 文件 =="
+          find out -name "*.symversions" | head
+          echo "== 目标符号 CRC（本次） =="
+          grep -rh -E "_dev_err|__alloc_pages_nodemask|anon_inode_getfd" out --include=*.symversions || echo "没抓到"
+          echo "== 设备基准（期望） =="
+          grep -E " (_dev_err|__alloc_pages_nodemask|anon_inode_getfd)$" refs/vendor_crc.txt
