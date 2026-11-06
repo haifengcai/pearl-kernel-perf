@@ -105,7 +105,9 @@ jobs:
           if [ "${{ inputs.zstd_upgrade }}" = "true" ]; then
             python3 scripts/set_config.py out/.config configs/zstd-upgrade.config
           fi
-          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- olddefconfig
           grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|WERROR|LOCALVERSION)=' out/.config
 
       - name: 编译内核 Image
@@ -117,7 +119,9 @@ jobs:
           export KBUILD_BUILD_USER=build
           export KBUILD_BUILD_HOST=pearl-ci
           export KBUILD_BUILD_TIMESTAMP="$(date -u '+%Y-%m-%d %H:%M:%S')"
-          time make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$JOBS" Image
+          time make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- -j"$JOBS" Image
 
       - name: 校验 vermagic（必须是设备原串，否则 vendor 模块加载失败）
         run: |
