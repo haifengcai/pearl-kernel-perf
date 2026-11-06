@@ -80,6 +80,22 @@ jobs:
         if: ${{ inputs.zstd_upgrade }}
         run: bash scripts/upgrade_zstd.sh "$PWD/kernel"
 
+      - name: 适配 apt 版 clang（去掉 AOSP 专属 MLGO 标志）
+        run: |
+          # 树里写死了 -mllvm -regalloc-enable-advisor=release 与 -mllvm -hot-cold-split=true，
+          # 这两个依赖 AOSP clang 内置的 ML 模型，普通 LLVM 会直接报
+          # "Requested regalloc eviction advisor analysis could not be created"。
+          # 去掉后只是少了 ML 指导的寄存器分配，不影响 ABI / vermagic。
+          hits=$(grep -rl -e 'regalloc-enable-advisor' -e 'hot-cold-split=true' kernel/ 2>/dev/null || true)
+          echo "命中文件: ${hits:-无}"
+          for f in $hits; do
+            sed -i '/regalloc-enable-advisor=release/d; /hot-cold-split=true/d' "$f"
+          done
+          if grep -rq -e 'regalloc-enable-advisor=release' kernel/ 2>/dev/null; then
+            echo "::error::MLGO 标志没清理干净"; exit 1
+          fi
+          echo "MLGO 标志已清理"
+
       - name: 生成 .config（设备原配置 + 性能补丁）
         run: |
           export PATH="/usr/lib/llvm-$LLVM_VERSION/bin:$PATH"
