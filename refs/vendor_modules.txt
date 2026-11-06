@@ -1,0 +1,14 @@
+apu_top.ko
+apusys.ko
+bt_drv_6895.ko
+ccci_dpmaif.ko
+ccci_md_all.ko
+conninfra.ko
+mali_kbase_mt6895.ko
+met.ko
+mtk-cam-isp.ko
+mtk_aie.ko
+mtk_fpsgo.ko
+mtk_imgsys_v4l2.ko
+snd-soc-mt6895-afe.ko
+wlan_drv_gen4m_6895.ko
