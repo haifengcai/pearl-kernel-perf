@@ -1,7 +1,7 @@
 name: probe-crc
 
-# 快速探针：只编 3 个目标文件，取出 genksyms 算出的符号 CRC，和设备 vendor 模块的基准值对比。
-# 本轮对比的是 LOCALVERSION_AUTO=y/n 对 CRC 的影响（它决定 CONFIG_MODULE_SCMVERSION 是否存在）。
+# 快速探针：只编 3 个目标文件，取出 genksyms 算出的符号 CRC，
+# 和设备 vendor 模块的基准值对比，用来确认哪棵树和设备内核一致。
 
 on:
   workflow_dispatch:
@@ -13,8 +13,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        localver_auto: ['y', 'n']
-    name: LOCALVERSION_AUTO=${{ matrix.localver_auto }}
+        branch:
+          - android12-5.10-2025-09_susfs
+    name: ${{ matrix.branch }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,11 +28,14 @@ jobs:
           sudo bash /tmp/llvm.sh 22
           /usr/lib/llvm-22/bin/clang --version | head -1
 
-      - name: 拉取内核源码
+      - name: 拉取内核源码（含子模块）
         run: |
-          git clone --depth 1 -b android12-5.10-2025-09 \
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            -b "${{ matrix.branch }}" \
             https://github.com/ztc1997/android_gki_kernel_5.10_common.git kernel
           git -C kernel rev-parse HEAD
+          git -C kernel submodule status || true
+          sed -n '1,5p' kernel/Makefile
 
       - name: 去掉 AOSP 专属 MLGO 标志
         run: |
@@ -39,29 +43,22 @@ jobs:
           for f in $hits; do
             sed -i '/regalloc-enable-advisor=release/d; /hot-cold-split=true/d' "$f"
           done
-          echo "清理了 ${hits:-0} 个文件"
+          echo "清理: ${hits:-无}"
 
-      - name: 生成配置（还原成设备原样的 LOCALVERSION 设置）
+      - name: 生成配置
         run: |
           export PATH="/usr/lib/llvm-22/bin:$PATH"
           mkdir -p out
           cp configs/device.config out/.config
-          # 还原成设备原配置：LOCALVERSION="-ztc1997" + LOCALVERSION_AUTO=y
           sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION="-ztc1997"|' out/.config
-          if [ "${{ matrix.localver_auto }}" = "y" ]; then
-            sed -i 's|^# CONFIG_LOCALVERSION_AUTO is not set|CONFIG_LOCALVERSION_AUTO=y|' out/.config
-          else
-            sed -i 's|^CONFIG_LOCALVERSION_AUTO=y|# CONFIG_LOCALVERSION_AUTO is not set|' out/.config
-          fi
+          sed -i 's|^# CONFIG_LOCALVERSION_AUTO is not set|CONFIG_LOCALVERSION_AUTO=y|' out/.config
           printf '# CONFIG_WERROR is not set\n' > /tmp/nowerror.config
           python3 scripts/set_config.py out/.config /tmp/nowerror.config
           make -C kernel O="$PWD/out" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- olddefconfig > /dev/null
-          echo "== 生效情况 =="
-          grep -E '^(CONFIG_MODULE_SCMVERSION|CONFIG_LOCALVERSION|CONFIG_LOCALVERSION_AUTO)=' out/.config || true
-          grep -E '^# CONFIG_(MODULE_SCMVERSION|LOCALVERSION_AUTO) is not set' out/.config || true
-          echo "kernel.release: $(cat out/include/config/kernel.release 2>/dev/null || echo 未生成)"
+          grep -E '^(CONFIG_MODULE_SCMVERSION|CONFIG_LOCALVERSION|CONFIG_BBG|CONFIG_KSU)' out/.config || true
+          grep -E '^# CONFIG_(BBG|KSU) is not set' out/.config || true
 
       - name: 编 3 个文件取 CRC
         run: |
@@ -70,7 +67,7 @@ jobs:
               CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
               CROSS_COMPILE_COMPAT=arm-linux-gnueabi-)
           "${MK[@]}" -j"$(nproc)" drivers/base/core.o mm/page_alloc.o fs/anon_inodes.o > build.log 2>&1 \
-            || { echo "编译失败"; tail -20 build.log; exit 1; }
+            || { echo "编译失败"; tail -25 build.log; exit 1; }
           echo "== 本次 CRC =="
           grep -rhE "^__crc_(__alloc_pages_nodemask|_dev_err|anon_inode_getfd) = " out --include=*.symversions || true
           echo "== 设备期望 =="
